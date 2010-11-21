@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0.0
+Encoding=UTF-8
+Name=Planarium Dictionary
+Exec=/usr/bin/planarium-dictionary
+Icon=planarium_icon_26x26
+Type=Application
+X-Osso-Service=planarium_dictionary
+X-Osso-Type=application/x-executable

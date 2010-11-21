@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=com.nokia.planarium_dictionary
+Exec=/usr/bin/planarium-dictionary

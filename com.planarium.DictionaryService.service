@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=com.planarium.DictionaryService
+Exec=/home/user/src/Ilya_Zayats_3/dictionary_server.py
