@@ -1,0 +1,363 @@
+#!/usr/bin/python2.5
+
+# Exercise 7
+# @author Alex Vedyakov
+# @author Ilya Zayats
+# @company NRU ITMO
+
+import sys
+from PySide.QtCore import *
+from PySide.QtGui import *
+from PySide.QtNetwork import *
+import dbus, dbus.service, dbus.mainloop.glib
+
+# configuration
+connectionTimeout=30000
+quitTimeout=120000
+defaultServer='dict.org'
+defaultPort=2628
+# =======
+
+class Connector(QObject): # socket manager
+  connected = Signal()
+  disconnected = Signal()
+  received = Signal(str)
+  failed = Signal(str)
+  
+  def __init__(self):
+    super(Connector, self).__init__()
+    
+    self.status='disconnected'
+    
+    self.socket=QTcpSocket()
+    self.connect(self.socket, SIGNAL('connected()'), self.on_connected)
+    self.connect(self.socket, SIGNAL('disconnected()'), self.on_disconnected)
+    self.connect(self.socket, SIGNAL('readyRead()'), self.on_data_received)
+  
+  def __del__(self):
+    self.closeConnection()
+  
+  #signals hanlers
+  def on_connected(self):
+    self.status='connected'
+    self.connected.emit()
+    
+  def on_disconnected(self):
+    self.status='disconnected'
+    self.disconnected.emit()
+
+  def on_data_received(self):
+    while self.socket.canReadLine():
+      line=str(self.socket.readLine())
+      self.received.emit(line)
+    
+  def on_error(self, error):
+    self.status='error'
+    errorText = self.socket.errorString()
+    self.failed(error+':'+errorText)
+    
+  def config(self,host,port):
+    self.host = host
+    self.port = port
+    
+  #main methods
+  def openConnection(self):
+    if self.status!='disconnected':
+      self.closeConnection()
+    
+    self.socket.connectToHost(self.host, self.port)
+    
+    if not self.socket.waitForConnected():
+      self.t=QTimer()
+      self.t.setSingleShot(True)
+      self.t.timeout.connect(self.openConnection)
+      self.t.start(1000)
+      
+  def closeConnection(self):
+    self.socket.close()
+  
+  def send(self,command):
+    self.socket.write(command.encode('utf-8'))
+
+# backend
+class listGetter(QObject):
+  returnData = Signal(str)
+  returnError = Signal(str)
+  
+  def __init__(self,connector):
+    super(listGetter, self).__init__()
+    
+    self.connector = connector
+    self.isList = False
+    self.list = ''
+    
+  def get(self):
+    self.connector.send('show databases\r\n')
+    
+  def parseAnswer(self,data):
+    
+    if data.strip()=='.':
+      self.isList=False
+    
+    elif self.isList==True and data.strip().split(' ',2)[2]!='databases present':
+      shortName=data.split(' ',1)[0]
+      if shortName!='--exit--' and shortName!='all':
+        self.list+=data
+    
+    else:
+
+        code=data.strip()[:3]
+      
+        if code=='110': # a number of dictionaries
+          self.isList=True
+          self.list=''
+          data=''
+        elif code=='250': # ok
+          self.isList=False
+          if self.list != '':
+            self.returnData.emit(self.list.strip())
+        elif code[:1]=='4' or code[:1]=='5': # errors
+          self.isList=False
+          self.returnError.emit(data)
+
+class definitionGetter(QObject):
+  returnData = Signal(str)
+  returnError = Signal(str)
+  
+  def __init__(self,connector,word,dictionary):
+    super(definitionGetter, self).__init__()
+    
+    self.connector = connector
+    self.isDefinition = False
+    self.definition = ''
+    self.word=word
+    self.dictionary=dictionary
+    
+  def get(self):
+    self.connector.send('define '+self.dictionary+' '+self.word+'\r\n')
+    
+  def parseAnswer(self,data):
+    if data.strip()=='.':
+        self.isDefinition=False
+        
+    elif self.isDefinition:
+      self.definition+=data
+      
+    else:
+        code=data.strip()[:3]
+        
+        if code=='150': # a number of definitions have been found
+          self.isDefinition=False
+        
+        elif code=='151': # a definition, coming from one given dictionary, follows on multiple lines
+          self.isDefinition=True
+          if self.dictionary=='*':
+            self.definition+='\n*From '+data.split('"')[3]+':\n'
+        
+        elif code=='552': # no defition found for the requested word
+          self.isDefinition=False
+          self.definition='Definition not found.'
+          self.returnData.emit(self.definition)
+        
+        elif code=='250': # OK. The server is waiting for a command.
+          self.isDefinition=False
+          
+          if self.definition!='': # end define request
+            self.definition=self.definition.strip()
+            self.returnData.emit(self.definition)
+
+        elif code[:1]=='4' or code[:1]=='5': # other(no 552) errors
+          self.isDefinition=False
+          self.returnError.emit(data)
+    
+class DictionaryEngine(dbus.service.Object):
+  
+  def __init__(self, bus_name, object_path="/com/planarium/DictionaryObject"):
+    dbus.service.Object.__init__(self, bus_name, object_path)
+    
+    self.dictConn=Connector()
+    self.dictConn.connected.connect(self.on_connected)
+    self.dictConn.disconnected.connect(self.on_disconnected)
+    self.dictConn.received.connect(self.on_received)
+    self.dictConn.failed.connect(self.on_error)
+
+    self.host=defaultServer
+    self.port=defaultPort
+    
+    self.definitionGetter=False
+    self.listGetter=False
+    
+    self.status=''
+    
+    self.setStatus('disconnected')
+    
+    self.connectionTimer=QTimer()
+    self.connectionTimer.setSingleShot(True)
+    self.connectionTimer.timeout.connect(self.dictQuit)
+    self.connectionTimer.start(connectionTimeout)
+    self.quitTimer=QTimer()
+    self.quitTimer.setSingleShot(True)
+    self.quitTimer.timeout.connect(self.quit)
+    self.quitTimer.start(quitTimeout)
+      
+  def quit(self):
+    self.setStatus('sleep')
+    app.quit()
+    
+  def setList(self,data):
+    self.listGetter=False
+    self.returnListDictionaries(data)
+    self.setStatus('ready')
+  
+  def setDefinition(self,definition):
+    self.definitionGetter=False
+    self.returnDefinition(definition)
+    self.setStatus('ready')
+  
+  def showError(self,error):
+    self.listGetter=False
+    self.definitionGetter=False
+    self.returnError(error)
+    
+  #External methods
+  @dbus.service.method("com.planarium.DictionaryService")
+  def setServer(self,host):
+    if self.status!='busy':
+      self.host=host
+      self.openConnection()
+      return 'ok'
+    else:
+      return 'busy'
+  
+  @dbus.service.method("com.planarium.DictionaryService")
+  def listDictionaries(self):
+    if self.status!='busy':
+      self.definitionGetter=False
+      self.setStatus('busy')
+      if not self.listGetter:
+        self.listGetter=listGetter(self.dictConn)
+        self.listGetter.returnData.connect(self.setList)
+        self.listGetter.returnError.connect(self.returnError)
+        
+      if self.status=='ready':
+        self.listGetter.get()
+      else:
+        self.readyCallback=self.listGetter.get
+        self.openConnection()
+      
+      return 'ok'
+    else:
+      return 'busy'
+  
+  @dbus.service.signal("com.planarium.DictionaryService")
+  def returnListDictionaries(self,listDictionaries):
+    pass
+  
+  @dbus.service.method("com.planarium.DictionaryService")
+  def define(self,word,dictionary):
+    if self.status!='busy':
+      self.listGetter=False
+      self.setStatus('busy')
+      if not self.definitionGetter:
+        self.definitionGetter=definitionGetter(self.dictConn,word.lower(),dictionary)
+        self.definitionGetter.returnData.connect(self.setDefinition)
+        self.definitionGetter.returnError.connect(self.showError)
+        
+      if self.status=='ready':
+        self.definitionGetter.init()
+      else:
+        self.readyCallback=self.definitionGetter.get
+        self.openConnection()
+      
+      return 'ok'
+    else:
+      return 'busy'
+  
+  @dbus.service.signal("com.planarium.DictionaryService")
+  def returnDefinition(self,definition):
+    pass
+    
+  @dbus.service.signal("com.planarium.DictionaryService")
+  def returnStatus(self,status):
+    pass
+    
+  @dbus.service.signal("com.planarium.DictionaryService")
+  def returnError(self,error):
+    pass
+    
+  #signals handlers from Connector
+  def on_connected(self):
+    self.setStatus('connected')
+    
+  def on_disconnected(self):
+    self.setStatus('disconnected')
+    
+  def on_received(self,data):
+    self.parse(data)
+    
+  def on_error(self,error):
+    self.returnError(error)
+  
+  #status methods
+  def setStatus(self,status):
+    if self.status!='ready' and status=='ready':
+      if self.readyCallback:
+        self.readyCallback()
+        self.readyCallback=False
+      
+      self.connectionTimer.start(connectionTimeout)
+      self.quitTimer.start(quitTimeout)
+    
+    self.returnStatus(status)
+    self.status=status
+    
+  
+  #commands for dictionary
+  def openConnection(self):
+    self.setStatus('disconnected')
+    self.dictConn.config(self.host,self.port)
+    self.dictConn.openConnection()
+    
+  def dictHello(self):
+    self.dictConn.send('client planariumDictionary\r\n')
+  
+  def dictQuit(self):
+    self.dictConn.send('quit\r\n')
+    
+  #main methods
+  def parse(self,data):
+    if self.status=='ready' and self.definitionGetter:
+      self.definitionGetter.parseAnswer(data)
+    elif self.status=='ready' and self.listGetter:
+      self.listGetter.parseAnswer(data)
+    else:
+      self.parseAnswer(data)
+      
+  def parseAnswer(self,data):
+
+    code=data.strip()[:3]
+    if code=='220' and self.status!='connecting': # server greeting
+      self.setStatus('connected to '+self.host)
+      self.dictHello()
+      
+    elif code=='221': # bye message
+      self.setStatus('disconnected')
+      
+    elif code=='250': # OK. The server is waiting for a command.
+      self.setStatus('ready')
+
+    elif code!=552 and (code[:1]=='4' or code[:1]=='5'): # other(no 552) errors
+      self.returnError(data)
+      self.listGetter=False
+      self.definitionGetter=False
+    
+
+#start  
+if __name__ == '__main__':
+  dbus.mainloop.glib.DBusGMainLoop(set_as_default = True)
+  app = QCoreApplication([])
+  session_bus = dbus.SessionBus()
+  bus_name = dbus.service.BusName("com.planarium.DictionaryService", bus=session_bus)
+  dictEngine = DictionaryEngine(bus_name)
+  
+  app.exec_()

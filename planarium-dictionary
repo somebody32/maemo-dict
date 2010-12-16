@@ -1,10 +1,17 @@
+#!/usr/bin/python2.5
+
+# Exercise 7
+# @author Ilya Zayats
+# @author Alex Vedyakov
+# @company NRU ITMO
+
 from PySide . QtCore import *
 from PySide . QtGui import *
-import sys, dbus
+import sys, dbus, dbus.service, dbus.mainloop.glib
 
-class MyMainWindow ( QMainWindow ):
+class dictionaryGUI( QMainWindow ):
   def __init__ ( self ):
-    super (MyMainWindow, self). __init__ ()
+    super (dictionaryGUI, self). __init__ ()
     vbox = QVBoxLayout()
 
     main_widget = QWidget()
@@ -18,11 +25,10 @@ class MyMainWindow ( QMainWindow ):
     
     set_dict_action = menu.addAction("Select Dictionary")
     set_dict_action.triggered.connect(self.set_dictionary)
-
-    bus = dbus.SessionBus()
-    remote_dictionary = bus.get_object("com.planarium.DictionaryService", "/com/planarium/DictionaryObject")
-    self.dictionary_iface = dbus.Interface(remote_dictionary, "com.planarium.DictionaryInterface")
-
+    
+    self.server_name="dict.org"
+    self.server_status="init"
+    
     self.edit_line = QLineEdit()
     self.edit_line.returnPressed.connect(self.word_entered)
     vbox.addWidget(self.edit_line)
@@ -31,19 +37,41 @@ class MyMainWindow ( QMainWindow ):
     self.definition_area.property('kineticScroller').setEnabled(True)
     self.definition_area.setReadOnly(True)
     vbox.addWidget(self.definition_area)
-
-    main_widget.setLayout(vbox)
-
-  def word_entered(self):
-    self.dictionary_iface.define(self.edit_line.text()) # I think that I should pass current dictionary here, if yes, then add self.current_dictionary to attributes
     
-  def definition_acquired(text): #call this from the dbus signal when het response
+    self.status_line = QLabel("Status: initialization")
+    vbox.addWidget(self.status_line)
+    
+    main_widget.setLayout(vbox)
+    self.connectToBackend()
+      
+    self.dictionary_iface.listDictionaries()
+  
+  def connectToBackend(self):
+    bus = dbus.SessionBus()
+    remote_dictionary = bus.get_object("com.planarium.DictionaryService", "/com/planarium/DictionaryObject")
+    self.dictionary_iface = dbus.Interface(remote_dictionary, "com.planarium.DictionaryService")
+    self.dictionary_iface.connect_to_signal("returnDefinition", self.definition_acquired )
+    self.dictionary_iface.connect_to_signal("returnListDictionaries", self.set_servers_list )
+    self.dictionary_iface.connect_to_signal("returnStatus", self.set_server_status )
+    self.dictionary_iface.connect_to_signal("returnError", self.show_server_error )
+    
+    if self.server_name!='dict.org':
+      self.dictionary_iface.setServer(self.server_name)
+  
+  def word_entered(self):
+    word=self.edit_line.text().lower()
+    if self.server_status=='sleep':
+      self.connectToBackend()
+      
+    self.dictionary_iface.define(word,self.current_dictionary)
+    
+  def definition_acquired(self,text):
     self.definition_area.setPlainText(text)
     
   def clear_dictionaries(self):
-    self.dictionaries_list = []
-    self.current_dictionary = ""
-    self.current_dict_index = False
+    self.dictionaries_list = {}
+    self.current_dictionary = "*"
+    self.current_dict_index = 0
   
   def set_server(self):
     d = QDialog()
@@ -65,8 +93,10 @@ class MyMainWindow ( QMainWindow ):
     vbox.addWidget(QLabel("Select Dictionary"))
     self.dictionaries_list_box = QComboBox()
     
-    dl = self.dictionaries_list + ["All Dictionaries", "First Found"]
-    for dictionary in dl:
+    self.dictionaries_list_box.addItem("All Dictionaries")
+    self.dictionaries_list_box.addItem("First Found")
+    
+    for dictionary in self.dictionaries_list:
       self.dictionaries_list_box.addItem(dictionary)
       
     if self.current_dict_index:
@@ -81,6 +111,8 @@ class MyMainWindow ( QMainWindow ):
   
   def new_server_entered(self):
     self.clear_dictionaries()
+    if self.server_status=='sleep':
+      self.connectToBackend()
     self.dictionary_iface.setServer(self.server_name.text())
     
     
@@ -90,16 +122,31 @@ class MyMainWindow ( QMainWindow ):
     elif self.dictionaries_list_box.currentText() == "First Found":
       self.current_dictionary = "!"
     else:
-      self.current_dictionary = self.dictionaries_list_box.currentText()
+      self.current_dictionary = self.dictionaries_list[self.dictionaries_list_box.currentText()]
     self.current_dict_index = self.dictionaries_list_box.currentIndex()
     
-  def set_servers_list(self, servers_string): # call this when you will get dictionaries list
-    self.dictionaries_list = servers_string.split(",")
-  
+  def set_servers_list(self, servers_string):
+    self.last_error=False
+    dictionaries=servers_string.split("\r\n");
+    self.clear_dictionaries()
+    for line in dictionaries:
+      a=line.split(' ',1)
+      self.dictionaries_list[a[1][1:-1]]=a[0]
+        
+  def set_server_status(self, status_string):
+    self.last_error=False
+    self.server_status=status_string
+    self.status_line.setText('Status: '+status_string)
+    
+  def show_server_error(self, error_string):
+    if self.last_error!=error_string:
+      self.last_error=error_string
+      QMessageBox.critical(self, "Server error", error_string )
 
 if __name__ == '__main__':
-  app = QApplication ( sys . argv )
-  w = MyMainWindow ()
-  w . show ()
-  app . exec_ ()
-  sys . exit ()
+  dbus.mainloop.glib.DBusGMainLoop(set_as_default = True)
+  app = QApplication( sys . argv )
+  w = dictionaryGUI()
+  w.show()
+  app.exec_()
+  sys.exit()
